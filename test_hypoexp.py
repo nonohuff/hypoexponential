@@ -282,3 +282,114 @@ def test_decimal_parallel_matches_serial(monkeypatch):
     parallel, ok_p = _h._decimal_method(x, scales, 'pdf', digits)
     assert ok_s.all() and ok_p.all()
     assert np.array_equal(serial, parallel)
+
+
+# ---- Randomized stress tests (fixed seeds) -----------------------------------------------------
+
+def _random_scales(rng):
+    n = int(rng.choice([1, 2, 3, 5, 8]))
+    typ = rng.choice(['spread', 'close', 'wide', 'repeated'])
+    if typ == 'spread':
+        return rng.uniform(0.1, 5, n)
+    if typ == 'close':
+        return 1 + 10.0 ** rng.uniform(-9, -3) * np.arange(n)
+    if typ == 'wide':
+        return 10.0 ** rng.uniform(-3, 3, n)
+    return rng.choice(rng.uniform(0.3, 3, max(1, n // 2)), n)
+
+
+@pytest.mark.parametrize("kind", ['pdf', 'cdf'])
+def test_random_cases_within_tolerance_default_and_tight(kind):
+    """Default tolerance: every returned value is within 1e-6 relative of a 500-digit reference
+    (the float closed form is only accepted when its error bound says so). tolerance=1e-12 forces
+    the exact methods, which must agree to ~1e-13. Scalar and array calls must both hold."""
+    fn = hypoexp_pdf if kind == 'pdf' else hypoexp_cdf
+    rng = np.random.default_rng(2024 if kind == 'pdf' else 2025)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')  # no sanity-check failure may be reported on valid input
+        for _ in range(25):
+            scales = _random_scales(rng)
+            xs = 10.0 ** rng.uniform(-6, np.log10(scales.sum() * 8), 5)
+            refs = np.array([_reference(x, scales, kind) for x in xs])
+            default = fn(xs, scales)
+            tight = fn(xs, scales, tolerance=1e-12)
+            scalars = np.array([fn(float(x), scales) for x in xs])
+            for r, d, t, s in zip(refs, default, tight, scalars):
+                if r < 1e-290:
+                    continue
+                assert d == pytest.approx(r, rel=1e-6)
+                assert s == pytest.approx(r, rel=1e-6)
+                assert t == pytest.approx(r, rel=1e-12)
+
+
+def test_random_long_grids_no_false_alarms_and_accurate():
+    """Grids of 1000-5000 points (sorted, descending or random spacing, covering or not) must never
+    trigger the final sanity checks on valid input and must agree with the exact methods."""
+    rng = np.random.default_rng(7)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        for _ in range(20):
+            scales = _random_scales(rng)
+            mean, sd = scales.sum(), np.sqrt(np.sum(scales ** 2))
+            lo = 0.0 if rng.random() < 0.5 else rng.uniform(0, mean)
+            hi = rng.uniform(lo + 0.1 * sd, mean + 10 * sd)
+            m = int(rng.choice([1000, 2000, 5000]))
+            x = np.linspace(lo, hi, m) if rng.random() < 0.7 else np.sort(rng.uniform(lo, hi, m))
+            if rng.random() < 0.3:
+                x = x[::-1]
+            p, c = hypoexp_pdf(x, scales), hypoexp_cdf(x, scales)
+            assert np.all(p >= 0) and np.all((c >= 0) & (c <= 1)) and np.all(np.isfinite(p))
+            idx = rng.choice(m, 8, replace=False)
+            assert np.allclose(p[idx], hypoexp_pdf(x[idx], scales, tolerance=1e-12), rtol=1e-6, atol=1e-6 * p.max())
+            assert np.allclose(c[idx], hypoexp_cdf(x[idx], scales, tolerance=1e-12), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("method", ['phase_type', 'decimal'])
+@pytest.mark.parametrize("kind", ['pdf', 'cdf'])
+def test_forced_exact_methods_on_widely_spread_scales(method, kind):
+    scales = np.array([1e-3, 0.02, 0.5, 7.0, 300.0])
+    fn = hypoexp_pdf if kind == 'pdf' else hypoexp_cdf
+    for x in [1e-6, 1e-3, 0.1, 5.0, 300.0, 3000.0]:
+        ref = _reference(x, scales, kind)
+        assert fn(x, scales, method=method) == pytest.approx(ref, rel=1e-12, abs=1e-300)
+
+
+@pytest.mark.parametrize("scales", [[1e-8, 1e8], [1e-8, 1e-8, 1e8], [1e8, 1e-8, 1e-8]])
+def test_extreme_scale_ratios(scales):
+    # dominated by the slow phase: pdf(1) ~ (1/1e8) e^{-1e-8}, cdf(1) ~ 1e-8 (fast phases ~ finished)
+    assert hypoexp_pdf(1.0, scales) == pytest.approx(1e-8 * np.exp(-1e-8), rel=1e-6)
+    assert hypoexp_cdf(1.0, scales) == pytest.approx(_reference(1.0, scales, 'cdf'), rel=1e-6)
+    assert hypoexp_pdf(1e9, scales) == pytest.approx(1e-8 * np.exp(-10), rel=1e-6)
+
+
+def test_underflowing_inputs_give_zero_not_nan():
+    assert hypoexp_pdf(5e-324, [1e308, 1e308]) == 0.0
+    assert hypoexp_cdf(5e-324, [1e308, 1e308]) == 0.0
+    assert hypoexp_pdf(1e-320, [1e300, 2e300], method='phase_type') == 0.0
+    assert hypoexp_pdf(1e300, [1.0, 2.0]) == 0.0
+    assert hypoexp_cdf(1e300, [1.0, 1.0]) == 1.0
+    # scale invariance: pdf(cx; c*scales) = pdf(x; scales) / c
+    assert hypoexp_pdf(1e-300, [1e-300, 2e-300]) == pytest.approx(hypoexp_pdf(1.0, [1.0, 2.0]) * 1e300, rel=1e-12)
+    assert hypoexp_pdf(1e300, [1e300, 2e300]) == pytest.approx(hypoexp_pdf(1.0, [1.0, 2.0]) * 1e-300, rel=1e-12)
+
+
+def test_many_repeated_and_many_close_scales():
+    # Erlang(300, 1) at its mean and 1000 scales 1e-9 apart: deep in Decimal-hostile territory
+    assert hypoexp_pdf(300.0, np.ones(300)) == pytest.approx(float(mpmath.exp(-300) * mpmath.mpf(300) ** 299 / mpmath.factorial(299)), rel=1e-11)
+    assert hypoexp_cdf(300.0, np.ones(300)) == pytest.approx(float(mpmath.gammainc(300, 0, 300, regularized=True)), rel=1e-11)
+    close = 1 + 1e-9 * np.arange(1000)
+    assert hypoexp_pdf(1000.0, close) == pytest.approx(float(mpmath.exp(-1000) * mpmath.mpf(1000) ** 999 / mpmath.factorial(999)), rel=1e-6)
+
+
+def test_convolution_auto_path_matches_exact_and_falls_back_on_coarse_grid():
+    rng = np.random.default_rng(11)
+    for scales in [np.array([0.3, 1.0, 2.5]), np.array([1.0, 1.0, 0.5]), 1 + 1e-7 * np.arange(4)]:
+        x = np.linspace(0, 8 * scales.sum(), 150_001)
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            p = hypoexp_pdf(x, scales)
+        idx = rng.choice(x.size, 30, replace=False)
+        assert np.allclose(p[idx], hypoexp_pdf(x[idx], scales, tolerance=1e-12), atol=1e-6 * p.max())
+    with pytest.warns(UserWarning, match='Convolution'):
+        p = hypoexp_pdf(np.linspace(0, 1e4, 100_001), [1.0, 2.0])
+    assert p[2] == pytest.approx(_reference(0.2, [1.0, 2.0], 'pdf'), rel=1e-6)
