@@ -162,11 +162,14 @@ def test_weights_and_rvs():
 
 def test_slow_method_selection_heuristic():
     from hypoexp import _choose_slow_method, _predicted_cost
-    assert _choose_slow_method(1, 2, 28, 1e-6) == 'decimal'        # one point, two scales: Decimal is cheaper
-    assert _choose_slow_method(100, 2, 28, 1e-6) == 'phase_type'   # many points: vectorized phase-type wins
-    assert _choose_slow_method(1, 20, 240, 1e-6) == 'phase_type'   # many scales / high precision: Decimal too slow
-    assert _choose_slow_method(10000, 5, 28, 1e-14) == 'decimal'   # more accuracy than doubles allow -> Decimal
-    assert _predicted_cost('decimal', 1000, 5, 28) > _predicted_cost('phase_type', 1000, 5, 28)
+    two = np.array([1.0, 1.000001])
+    twenty = 1.0 + 1e-6 * np.arange(20)
+    one_point, many = np.array([1.0]), np.linspace(0.1, 10, 100)
+    assert _choose_slow_method(one_point, two, 28, 1e-6) == 'decimal'       # one point, two scales: Decimal is cheaper
+    assert _choose_slow_method(many, two, 28, 1e-6) == 'phase_type'         # many points: vectorized phase-type wins
+    assert _choose_slow_method(one_point, twenty, 240, 1e-6) == 'phase_type'  # many scales / high precision: Decimal too slow
+    assert _choose_slow_method(many, two, 28, 1e-14) == 'decimal'           # more accuracy than doubles allow -> Decimal
+    assert _predicted_cost('decimal', 1000, 5, 28) > _predicted_cost('phase_type', 1000, 5, 28, np.linspace(0.1, 10, 1000))
 
 
 def test_sanity_checks_catch_garbage_and_fall_back(monkeypatch):
@@ -196,3 +199,86 @@ def test_sanity_checks_pass_on_correct_results():
         assert _sanity_failures(x, hypoexp_pdf(x, sc), 'pdf', sc, 1e-6) == []
         assert _sanity_failures(x, hypoexp_cdf(x, sc), 'cdf', sc, 1e-6) == []
     assert 'pdf integrates' in _sanity_failures(x, 2 * hypoexp_pdf(x, [1.0, 2.0]), 'pdf', np.array([1.0, 2.0]), 1e-6)[-1]
+
+
+# ---- phase-type internals: series vs scaling-and-squaring -------------------------------------
+
+import hypoexp as _h
+
+
+@pytest.mark.parametrize("scales", [[1.0, 2.0], [1.0, 1.0, 2.0], [3.0] * 6, list(1.0 + 1e-6 * np.arange(10)), [0.2, 0.7, 1.5, 4.0]])
+@pytest.mark.parametrize("kind", ['pdf', 'cdf'])
+def test_phase_type_series_and_squaring_agree(scales, kind):
+    scales = np.asarray(scales, dtype=float)
+    mu = (1.0 / scales).max()
+    x = np.concatenate([[0.0, 1e-9, 1e-3], np.geomspace(0.01, 5e4, 60) / mu])
+    a = _h._phase_type_series(x, scales, kind)
+    b = _h._phase_type_squaring(x, scales, kind)
+    mask = b > 1e-290
+    assert np.allclose(a[mask], b[mask], rtol=5e-12, atol=0)
+    assert np.all(a[~mask] <= 1e-280)
+
+
+@pytest.mark.parametrize("scales", [[1.0, 2.0], [0.5, 1.0, 2.0, 4.0, 8.0], list(1.0 + 1e-6 * np.arange(10))])
+@pytest.mark.parametrize("kind", ['pdf', 'cdf'])
+def test_phase_type_series_matches_reference_up_to_large_lambda(scales, kind):
+    scales = np.asarray(scales, dtype=float)
+    mu = (1.0 / scales).max()
+    x = np.array([1e-6, 0.3, 2.0, 50.0, 700.0, 5e3, 5e4]) / mu
+    got = _h._phase_type_series(x, scales, kind) * ((1.0 / scales[-1]) if kind == 'pdf' else 1.0)
+    for xi, gi in zip(x, got):
+        ref = _reference(xi, scales, kind)
+        if ref > 1e-290:
+            assert gi == pytest.approx(ref, rel=2e-12), (xi, kind)
+
+
+def test_phase_type_result_independent_of_series_squaring_split(monkeypatch):
+    scales = np.array([0.5, 1.0, 1.0, 3.0])
+    x = np.linspace(0, 40, 2001)
+    auto = _h._phase_type_method(x, scales, 'pdf')
+    monkeypatch.setattr(_h, '_phase_type_plan', lambda lam, n: (np.inf, 0.0))
+    all_series = _h._phase_type_method(x, scales, 'pdf')
+    monkeypatch.setattr(_h, '_phase_type_plan', lambda lam, n: (-1.0, 0.0))
+    all_squaring = _h._phase_type_method(x, scales, 'pdf')
+    assert np.allclose(auto, all_series, rtol=1e-12, atol=1e-300)
+    assert np.allclose(auto, all_squaring, rtol=1e-12, atol=1e-300)
+
+
+def test_phase_type_tail_dominated_by_poisson_tail():
+    # Erlang(2, 1) at x = 25: c_k is nonzero only at k = 1, far below the Poisson mode k = 25
+    assert hypoexp_pdf(25.0, [1.0, 1.0]) == pytest.approx(25 * np.exp(-25), rel=1e-12)
+    assert hypoexp_pdf(2000.0, [3.0]) == pytest.approx(np.exp(-2000 / 3) / 3, rel=1e-12)
+
+
+def test_phase_type_cdf_never_exceeds_one_and_is_fast_for_many_scales():
+    scales = np.ones(100)
+    x = np.linspace(0, 400, 20001)
+    t0 = time.perf_counter()
+    c = hypoexp_cdf(x, scales)
+    p = hypoexp_pdf(x, scales)
+    assert time.perf_counter() - t0 < 5.0
+    assert np.all(c <= 1.0) and np.all(np.diff(c) >= -1e-14)  # monotone up to rounding
+    assert np.trapezoid(p, x) == pytest.approx(1.0, abs=1e-6)
+    assert np.argmax(p) == pytest.approx(np.searchsorted(x, 99.0), abs=5)  # mode of Erlang(100, 1) is 99
+
+
+# ---- Decimal internals -----------------------------------------------------------------------
+
+def test_decimal_converges_from_too_low_start_precision():
+    scales = 1.0 + 1e-6 * np.arange(10)
+    x = np.array([0.1, 1.0, 10.0, 30.0])
+    value, ok = _h._decimal_method(x, scales, 'pdf', np.full(x.size, 28.0))
+    assert ok.all()
+    for xi, vi in zip(x, value):
+        assert vi == pytest.approx(_reference(xi, scales, 'pdf'), rel=1e-14)
+
+
+def test_decimal_parallel_matches_serial(monkeypatch):
+    scales = np.array([1.0, 1.5, 2.0])
+    x = np.linspace(0.1, 10, 64)
+    digits = np.full(x.size, 40.0)
+    serial, ok_s = _h._decimal_chunk((x, scales, 'pdf', digits, 2000))
+    monkeypatch.setattr(_h, '_DECIMAL_PARALLEL_MIN_COST', 0.0)
+    parallel, ok_p = _h._decimal_method(x, scales, 'pdf', digits)
+    assert ok_s.all() and ok_p.all()
+    assert np.array_equal(serial, parallel)

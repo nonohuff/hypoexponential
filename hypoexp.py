@@ -3,6 +3,8 @@ import scipy as sp
 from typing import Union
 from decimal import Decimal, localcontext
 import warnings
+import os
+import concurrent.futures
 
 ArrayLike = Union[int, float, list, 'np.ndarray']
 
@@ -100,75 +102,226 @@ def _closed_form_method(x, scales, kind):
     return value, rel_err
 
 
+def _decimal_terms(x_dec, scales_dec, weights, kind):
+    terms, bounds = [], []
+    for w, s_i in zip(weights, scales_dec):
+        e = (-x_dec / s_i).exp()
+        if kind == 'pdf':
+            t = w * e / s_i
+            terms.append(t)
+            bounds.append(abs(t))
+        else:
+            one_minus_e = 1 - e
+            terms.append(w * one_minus_e)
+            # 1 - e is computed with absolute error ~10^-prec, so its relative error can be large
+            bounds.append(abs(w) * (1 + abs(one_minus_e)))
+    return terms, bounds
+
+
+def _decimal_weights(scales_dec):
+    ws = []
+    for i, s_i in enumerate(scales_dec):
+        w = Decimal(1)
+        for j, s_j in enumerate(scales_dec):
+            if i != j:
+                w *= s_i / (s_i - s_j)
+        ws.append(w)
+    return ws
+
+
+def _decimal_chunk(args):
+    x, scales, kind, start_digits, max_digits = args
+    scales_dec = [Decimal(float(s)) for s in scales]
+    n = len(scales_dec)
+    out = np.empty(x.size)
+    ok = np.zeros(x.size, dtype=bool)
+    weights_cache = {}
+    with localcontext() as ctx:
+        for k, x_k in enumerate(x):
+            x_dec = Decimal(float(x_k))
+            prec = int(start_digits[k])
+            value = float('nan')
+            while prec <= max_digits:
+                ctx.prec = prec
+                if prec not in weights_cache:
+                    weights_cache[prec] = _decimal_weights(scales_dec)
+                terms, bounds = _decimal_terms(x_dec, scales_dec, weights_cache[prec], kind)
+                total = sum(terms, Decimal(0))
+                value = float(total)
+                # every term carries <= (2n + 4) roundings (weights, exp, products) and the sum
+                # another n, each of relative size 10^-prec
+                err = (3 * n + 4) * Decimal(10) ** (-prec) * sum(bounds, Decimal(0))
+                if total != 0 and err <= Decimal('1e-17') * abs(total):
+                    ok[k] = True
+                    break
+                if total == 0 or err > abs(total):
+                    # the computed total is itself dominated by rounding error, so it cannot be
+                    # used to estimate the precision needed: double instead
+                    prec *= 2
+                else:
+                    needed = (err / (Decimal('1e-17') * abs(total))).log10()
+                    prec = int(prec + float(needed)) + 8
+            out[k] = value
+    return out, ok
+
+
+_DECIMAL_PARALLEL_MIN_COST = 0.5  # predicted seconds above which points are spread over processes
+
+
 def _decimal_method(x, scales, kind, start_digits, max_digits=2000):
     """Closed form evaluated with the `decimal` module (distinct scales only).
 
     Arbitrary precision removes the cancellation problem of the float closed form, at the cost of
     speed (pure Python loops, cost grows with len(scales) and with the precision needed). For each
-    point the precision starts at `start_digits` (chosen from the float error bound) and doubles
-    until two consecutive evaluations agree to 1e-13 relative, which proves convergence; this
-    replaces the old "integrate to 1" criterion that could never be met for a single point or a
-    truncated grid. Points that still have not converged at `max_digits` are reported as failed.
+    point the precision starts at `start_digits` (chosen from the float error bound) and the result
+    is accepted when a rigorous rounding-error bound computed alongside it (from sum|term_i|, the
+    same quantity the float method uses) is below 1e-17 relative, which proves the float conversion
+    is exact to double precision. Otherwise the precision is raised to what the bound says is
+    needed and the point is re-evaluated (usually a single evaluation suffices). This replaces the
+    old "integrate to 1" criterion that could never be met for a single point or a truncated grid.
+    Points that still have not converged at `max_digits` are reported as failed.
+
+    Large workloads are split over worker processes (the decimal module releases no GIL work to
+    vectorize, so processes are the only way to use several cores).
 
     Returns (value, converged_mask).
     """
-    scales_dec = [Decimal(float(s)) for s in scales]
-    out = np.empty(x.size)
-    ok = np.zeros(x.size, dtype=bool)
-    weights_cache = {}
-
-    def weights(prec):
-        if prec not in weights_cache:
-            ws = []
-            for i, s_i in enumerate(scales_dec):
-                w = Decimal(1)
-                for j, s_j in enumerate(scales_dec):
-                    if i != j:
-                        w *= s_i / (s_i - s_j)
-                ws.append(w)
-            weights_cache[prec] = ws
-        return weights_cache[prec]
-
-    with localcontext() as ctx:
-        for k, x_k in enumerate(x):
-            x_dec = Decimal(float(x_k))
-            prec = int(start_digits[k])
-            previous = None
-            while prec <= max_digits:
-                ctx.prec = prec
-                total = Decimal(0)
-                for w, s_i in zip(weights(prec), scales_dec):
-                    e = (-x_dec / s_i).exp()
-                    total += w * e / s_i if kind == 'pdf' else w * (1 - e)
-                value = float(total)
-                if previous is not None and value > 0 and abs(value - previous) <= 1e-13 * value:
-                    out[k], ok[k] = value, True
-                    break
-                previous = value
-                prec *= 2
-            else:
-                out[k] = previous
-    return out, ok
+    start_digits = np.asarray(start_digits, dtype=float)
+    n_workers = os.cpu_count() or 1
+    if _decimal_uses_pool(x.size, scales.size, start_digits):
+        chunks = np.array_split(np.arange(x.size), n_workers)
+        args = [(x[c], scales, kind, start_digits[c], max_digits) for c in chunks]
+        try:
+            with concurrent.futures.ProcessPoolExecutor(n_workers) as pool:
+                results = list(pool.map(_decimal_chunk, args))
+        except (OSError, RuntimeError, concurrent.futures.process.BrokenProcessPool):
+            results = None
+        if results is not None:
+            return np.concatenate([r[0] for r in results]), np.concatenate([r[1] for r in results])
+    return _decimal_chunk((x, scales, kind, start_digits, max_digits))
 
 
-def _phase_type_method(x, scales, kind, max_block_entries=2 ** 22):
-    """Phase-type representation, valid for any scales including repeated ones.
-    https://en.wikipedia.org/wiki/Hypoexponential_distribution#Relation_to_the_phase-type_distribution
+# cost model (seconds, fitted on one machine; only ratios matter) used to split the points between
+# the two uniformization variants and, in _choose_slow_method, against the Decimal method
+_SERIES_FIXED_PER_K = 6.5e-6   # one step of the c_k recursion
+_SERIES_PER_TERM = 4e-9        # one Poisson term for one point
+_SERIES_PER_BLOCK = 5e-5       # fixed overhead of one block of points
+_SQUARING_PER_POINT = 2e-6     # one point costs this ...
+_SQUARING_PER_POINT_N3 = 1e-8  # ... plus this * (n+1)^3
+_SERIES_MAX_LAMBDA = 1e5       # c_k rounding error grows like ~k * eps, keep it below ~1e-11
+_SERIES_MAX_BLOCK_ENTRIES = 2 ** 22
 
-    The distribution is the absorption time of the Markov chain 0 -> 1 -> ... -> n (state i leaves
-    at rate 1/scale_i, state n absorbing) with generator Q, so with alpha = (1, 0, ..., 0):
-        pdf(x) = rate_{n-1} * expm(x Q)[0, n-1],   cdf(x) = expm(x Q)[0, n].
-    The matrix exponential is evaluated by uniformization rather than scipy.linalg.expm: with
-    mu = max(rate) and h = x / 2**s chosen so that h*mu <= 1,
-        expm(h Q) = exp(-h mu) * expm(h (Q + mu I)),
-    where h (Q + mu I) is a nonnegative matrix with row sums <= 1. Its Taylor series has only
-    nonnegative terms and the s squarings that give expm(x Q) only multiply and add nonnegative
-    matrices, so no cancellation ever occurs and every entry is accurate to ~machine precision,
-    including tiny values for very small or very large x (scipy's expm is accurate for moderate x
-    but loses relative accuracy at small x, e.g. 2e-4 relative error at x = 1e-6 for scales
-    [1, 1, 2]). Cost is O(len(x) * (len(scales) + log2(x*mu)) * len(scales)^3), so this is the
-    slowest float method for many points and large len(scales), but it is fully vectorized over x.
+
+def _series_blocks(lam_sorted, n):
+    """Cut sorted lambdas into blocks [start, stop) whose range is <= 10 sqrt(lambda) so that one
+    Poisson window of half-width 12 sqrt(lambda) + n + 30 around the block's mode covers all of
+    them. Returns a list of (start, stop, half_width)."""
+    blocks = []
+    start = 0
+    m = lam_sorted.size
+    while start < m:
+        lo = lam_sorted[start]
+        stop = int(np.searchsorted(lam_sorted, lo + 10 * np.sqrt(lo + 1), side='right'))
+        hi = lam_sorted[stop - 1]
+        half = int(12 * np.sqrt(hi + 1) + n + 30)
+        stop = min(stop, start + max(1, _SERIES_MAX_BLOCK_ENTRIES // (2 * half + 1)))
+        blocks.append((start, stop, half))
+        start = stop
+    return blocks
+
+
+def _phase_type_series(x, scales, kind):
+    """Uniformization series, see _phase_type_method:
+
+        value(x) = sum_k Poisson(k; lambda) c_k,   lambda = x mu,   c_k = (alpha P^k)[col],
+        P = I + Q / mu.
+
+    The c_k do not depend on x and are obtained by K vector-bidiagonal products, O(K n) in total
+    with K ~ lambda_max. The points are sorted by lambda and cut into blocks (_series_blocks); in
+    a block the Poisson weights are generated from the weight at the block's mode k0 by the
+    recursions w_{k+1} = w_k lambda / (k + 1) and w_{k-1} = w_k k / lambda, as cumulative
+    products over a window of indices, vectorized over both points and indices (no Python loop
+    over k). Each sweep is extended, for the points that need it, until a rigorous bound on the
+    remaining tail (0 <= c_k <= 1, geometric decay of the weights) is below eps times the value
+    accumulated so far; typically ~24 sqrt(lambda) + 2n terms suffice. Finally the result is
+    divided by the sum of the weights used (= 1 up to the negligible tails), which removes the
+    rounding error of the starting weight exp(k0 log lambda - lambda - lgamma(k0 + 1)) whose
+    argument is large for large lambda. Everything is nonnegative, so no cancellation.
     """
+    rates = 1.0 / scales
+    n = rates.size
+    mu = rates.max()
+    stay = 1.0 - rates / mu
+    move = rates / mu
+    col = n - 1 if kind == 'pdf' else n
+    lam = x * mu
+    out = np.empty(x.size)
+
+    order = np.argsort(lam)
+    lam_sorted = lam[order]
+    lam_max = lam_sorted[-1]
+    # Poisson weights beyond the mode + 40 sigma underflow to exactly 0, so the upward sweep
+    # always terminates before K
+    K = int(np.ceil(lam_max + 40 * np.sqrt(lam_max + 1) + n + 50))
+
+    c = np.empty(K + 1)
+    v = np.zeros(n + 1)
+    v[0] = 1.0
+    for k in range(K + 1):
+        c[k] = v[col]
+        nxt = np.empty(n + 1)
+        nxt[:n] = v[:n] * stay
+        nxt[1:n] += v[:n - 1] * move[:n - 1]
+        nxt[n] = v[n] + v[n - 1] * move[n - 1]
+        v = nxt
+
+    for start, stop, half in _series_blocks(lam_sorted, n):
+        idx = order[start:stop]
+        lb = lam_sorted[start:stop]
+        k0 = int(lb[0])
+        w0 = np.exp(sp.special.xlogy(k0, lb) - lb - sp.special.gammaln(k0 + 1))
+        acc = w0 * c[k0]
+        wsum = w0.copy()
+
+        # upward sweep: weights at k0+1 .. k_to
+        active = np.arange(lb.size)
+        w_last = w0.copy()
+        k_from, k_to = k0 + 1, min(K, k0 + half)
+        while k_from <= k_to and active.size:
+            ks = np.arange(k_from, k_to + 1)
+            W = w_last[active, None] * np.cumprod(lb[active, None] / ks[None, :], axis=1)
+            acc[active] += W @ c[ks]
+            wsum[active] += W.sum(axis=1)
+            w_last[active] = W[:, -1]
+            # k_to > hi >= lb here, so the remaining weights decay at least geometrically
+            tail = w_last[active] * (k_to + 1) / (k_to + 1 - lb[active])
+            active = active[tail > _EPS * acc[active]]
+            k_from, k_to = k_to + 1, min(K, k_to + half)
+
+        # downward sweep: weights at k0-1 .. k_to
+        active = np.arange(lb.size)
+        w_last = w0.copy()
+        k_from, k_to = k0 - 1, max(0, k0 - half)
+        while k_from >= k_to and active.size:
+            ks = np.arange(k_from, k_to - 1, -1)
+            W = w_last[active, None] * np.cumprod((ks[None, :] + 1) / lb[active, None], axis=1)
+            acc[active] += W @ c[ks]
+            wsum[active] += W.sum(axis=1)
+            w_last[active] = W[:, -1]
+            if k_to == 0:
+                break
+            # k_to < lo <= lb here
+            tail = w_last[active] * lb[active] / (lb[active] - k_to)
+            active = active[tail > _EPS * acc[active]]
+            k_from, k_to = k_to - 1, max(0, k_to - half)
+
+        out[idx] = acc / wsum
+    return out
+
+
+def _phase_type_squaring(x, scales, kind, max_block_entries=2 ** 22):
+    """Scaling-and-squaring version of the uniformization, chosen by the cost model in _phase_type_method.
+    O(len(x) * (len(scales) + log2(x mu)) * len(scales)^3), see _phase_type_method."""
     rates = 1.0 / scales
     n = rates.size
     mu = rates.max()
@@ -202,10 +355,74 @@ def _phase_type_method(x, scales, kind, max_block_entries=2 ** 22):
             E *= np.exp(-h * mu)[:, None, None]
             for _ in range(s):
                 E = E @ E
+                # E is stochastic; renormalizing the rows stops the row-sum rounding error from
+                # doubling at every squaring (2^s eps otherwise)
+                E /= E.sum(axis=2, keepdims=True)
             out[sel] = E[:, 0, col]
+    return out
 
+
+def _phase_type_plan(lam, n):
+    """Decide which lambdas = x mu the series variant should handle (those <= threshold; the
+    others go to scaling and squaring) by minimizing the modelled cost over a few candidate
+    thresholds. Returns (threshold, predicted_total_seconds)."""
+    lam_sorted = np.sort(lam)
+    m = lam_sorted.size
+    sq_point = _SQUARING_PER_POINT + _SQUARING_PER_POINT_N3 * (n + 1) ** 3
+    per_point = np.cumsum(_SERIES_PER_TERM * (34 * np.sqrt(lam_sorted) + 2 * n + 60))
+    best_cost, threshold = m * sq_point, -1.0
+    candidates = np.unique(np.minimum(m, np.geomspace(1, m, 24).astype(int)))
+    for j in candidates:
+        L = lam_sorted[j - 1]
+        if L > _SERIES_MAX_LAMBDA:
+            break
+        n_blocks = len(_series_blocks(lam_sorted[:j], n))
+        cost = (_SERIES_FIXED_PER_K * (L + 40 * np.sqrt(L + 1) + n + 50) + per_point[j - 1]
+                + _SERIES_PER_BLOCK * n_blocks + (m - j) * sq_point)
+        if cost < best_cost:
+            best_cost, threshold = cost, L
+    return threshold, best_cost
+
+
+def _phase_type_method(x, scales, kind):
+    """Phase-type representation, valid for any scales including repeated ones.
+    https://en.wikipedia.org/wiki/Hypoexponential_distribution#Relation_to_the_phase-type_distribution
+
+    The distribution is the absorption time of the Markov chain 0 -> 1 -> ... -> n (state i leaves
+    at rate 1/scale_i, state n absorbing) with generator Q, so with alpha = (1, 0, ..., 0)
+        pdf(x) = rate_{n-1} * expm(x Q)[0, n-1],   cdf(x) = expm(x Q)[0, n].
+    expm(x Q) is evaluated by uniformization rather than scipy.linalg.expm: with mu = max(rate)
+    and P = I + Q / mu (a nonnegative, bidiagonal stochastic matrix),
+        expm(x Q) = exp(-x mu) * sum_k (x mu)^k / k! * P^k,
+    a sum of nonnegative terms, so no cancellation ever occurs and every entry is accurate to
+    ~machine precision, including tiny values for very small or very large x (scipy's expm loses
+    relative accuracy at small x, e.g. 2e-4 relative error at x = 1e-6 for scales [1, 1, 2]).
+
+    Two variants, with lambda = x mu:
+      * _phase_type_series sums the series directly: a fixed O(lambda_max n) part plus
+        O(sqrt(lambda) + n) per point, i.e. essentially linear in both len(x) and len(scales).
+        Rounding error ~ lambda eps, so it is only used for lambda <= 1e5.
+      * _phase_type_squaring uses scaling and squaring of expm(h Q), h mu <= 1:
+        O((n + log2 lambda) n^3) per point, accurate to ~n eps for any lambda.
+    The points are split between the two by a small cost model (small n and large lambda favour
+    squaring, large n or many points favour the series).
+    """
+    x = np.asarray(x, dtype=float)
+    n = scales.size
+    mu = (1.0 / scales).max()
+    lam = x * mu
+    out = np.empty(x.size)
+
+    threshold, _ = _phase_type_plan(lam, n)
+    use_series = lam <= threshold
+    if np.any(use_series):
+        out[use_series] = _phase_type_series(x[use_series], scales, kind)
+    if not np.all(use_series):
+        out[~use_series] = _phase_type_squaring(x[~use_series], scales, kind)
     if kind == 'pdf':
-        out *= rates[-1]
+        out *= 1.0 / scales[-1]
+    else:
+        np.minimum(out, 1.0, out=out)
     return out
 
 
@@ -242,25 +459,50 @@ def _convolution_method(x, scales):
 # superlinear in d. The phase-type method is vectorized: a fixed overhead plus a per-point cost that
 # is tiny for small n and grows like (n + 1)^3. In practice Decimal only wins for 1-2 points with
 # few scales and modest precision, but the model keeps the choice data driven.
-_DECIMAL_COST_PER_POINT = 3e-5
-_PHASE_TYPE_OVERHEAD = 1.5e-4
-_PHASE_TYPE_COST_PER_POINT = 1e-6
-_PHASE_TYPE_COST_PER_POINT_N3 = 4e-9
+# Decimal cost model (seconds, fitted on the same machine as the phase-type constants)
+_DECIMAL_PER_TERM = 1.8e-5     # one exp + products at 28 digits; grows like sqrt(digits)
+_DECIMAL_PER_WEIGHT = 4e-6     # one of the n^2 ratio products, per precision level; linear in digits
+_DECIMAL_POOL_OVERHEAD = 0.05  # starting the worker processes
+_DECIMAL_POOL_EFFICIENCY = 0.8
+_PHASE_TYPE_OVERHEAD = 2e-4    # fixed cost of one phase-type call
 
 
-def _predicted_cost(method, m, n, digits):
+def _decimal_serial_cost(m, n, digits):
+    d = np.broadcast_to(np.asarray(digits, dtype=float), (m,)) / 28.0
+    levels = np.unique(d).size
+    return _DECIMAL_PER_TERM * n * np.sum(np.sqrt(d)) + levels * n * n * _DECIMAL_PER_WEIGHT * np.mean(d)
+
+
+def _decimal_uses_pool(m, n, digits):
+    workers = os.cpu_count() or 1
+    return workers > 1 and m >= 2 * workers and _decimal_serial_cost(m, n, digits) > _DECIMAL_PARALLEL_MIN_COST
+
+
+def _predicted_cost(method, m, n, digits, lam=None):
+    """Predicted seconds for one of the exact fallbacks on m points with n scales. `digits` is the
+    Decimal starting precision (scalar or one value per point); `lam` = x * max(rate) is needed
+    for the phase-type method, whose cost depends on how far in the tail the points lie."""
     if method == 'decimal':
-        return m * n * _DECIMAL_COST_PER_POINT * (digits / 28.0) ** 1.5
-    return _PHASE_TYPE_OVERHEAD + m * (_PHASE_TYPE_COST_PER_POINT + _PHASE_TYPE_COST_PER_POINT_N3 * (n + 1) ** 3)
+        serial = _decimal_serial_cost(m, n, digits)
+        if _decimal_uses_pool(m, n, digits):
+            return _DECIMAL_POOL_OVERHEAD + serial / (_DECIMAL_POOL_EFFICIENCY * (os.cpu_count() or 1))
+        return serial
+    lam = np.ones(m) if lam is None else np.asarray(lam, dtype=float)
+    return _PHASE_TYPE_OVERHEAD + _phase_type_plan(lam, n)[1]
 
 
-def _choose_slow_method(m, n, digits, tolerance):
-    """Pick the exact fallback for m points. Decimal when the caller asks for more accuracy than
-    double precision can deliver (the phase-type method is accurate to ~1e-14 relative), otherwise
-    whichever the cost model predicts to be faster."""
+def _choose_slow_method(x, scales, digits, tolerance):
+    """Pick the exact fallback for the points x. Decimal when the caller asks for more accuracy
+    than double precision can deliver (the phase-type method is accurate to ~1e-13 relative),
+    otherwise whichever the cost model predicts to be faster. Empirically (see the notebook)
+    Decimal only wins for a handful of points with few scales and moderate precision; the
+    vectorized phase-type method wins for many points, and for many scales because its cost is
+    ~linear in len(scales) while Decimal's weights alone cost O(len(scales)^2)."""
     if tolerance < 1e-12:
         return 'decimal'
-    if _predicted_cost('decimal', m, n, digits) < _predicted_cost('phase_type', m, n, digits):
+    m, n = x.size, scales.size
+    lam = x * (1.0 / scales).max()
+    if _predicted_cost('decimal', m, n, digits) < _predicted_cost('phase_type', m, n, digits, lam):
         return 'decimal'
     return 'phase_type'
 
@@ -269,7 +511,7 @@ def _start_digits(rel_err):
     with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
         digits = 17 + np.log10(rel_err / _EPS)
     digits = np.where(np.isfinite(digits), digits, 60)
-    return np.clip(np.ceil(digits), 28, 400)
+    return np.clip(np.ceil(digits), 28, 2000)
 
 
 def _slow(x, scales, kind, method, start_digits):
@@ -305,7 +547,7 @@ def _pointwise(x, scales, kind, tolerance, method):
     todo = np.flatnonzero(~good)
     if todo.size:
         digits = _start_digits(rel_err[todo])
-        slow_method = _choose_slow_method(todo.size, n, float(np.median(digits)), tolerance)
+        slow_method = _choose_slow_method(x[todo], scales, digits, tolerance)
         res[todo] = _slow(x[todo], scales, kind, slow_method, digits)
     return res
 
