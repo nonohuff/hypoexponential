@@ -236,41 +236,118 @@ def _convolution_method(x, scales):
     return np.maximum(pdf, 0.0)
 
 
+# Empirical cost model (seconds) for the two slow, exact fallbacks, fitted on this machine
+# (see the "Decimal vs phase-type" section of the notebook). m = number of points, n = len(scales),
+# d = starting Decimal precision in digits. Decimal is a pure-Python loop: linear in m and n, and
+# superlinear in d. The phase-type method is vectorized: a fixed overhead plus a per-point cost that
+# is tiny for small n and grows like (n + 1)^3. In practice Decimal only wins for 1-2 points with
+# few scales and modest precision, but the model keeps the choice data driven.
+_DECIMAL_COST_PER_POINT = 3e-5
+_PHASE_TYPE_OVERHEAD = 1.5e-4
+_PHASE_TYPE_COST_PER_POINT = 1e-6
+_PHASE_TYPE_COST_PER_POINT_N3 = 4e-9
+
+
+def _predicted_cost(method, m, n, digits):
+    if method == 'decimal':
+        return m * n * _DECIMAL_COST_PER_POINT * (digits / 28.0) ** 1.5
+    return _PHASE_TYPE_OVERHEAD + m * (_PHASE_TYPE_COST_PER_POINT + _PHASE_TYPE_COST_PER_POINT_N3 * (n + 1) ** 3)
+
+
+def _choose_slow_method(m, n, digits, tolerance):
+    """Pick the exact fallback for m points. Decimal when the caller asks for more accuracy than
+    double precision can deliver (the phase-type method is accurate to ~1e-14 relative), otherwise
+    whichever the cost model predicts to be faster."""
+    if tolerance < 1e-12:
+        return 'decimal'
+    if _predicted_cost('decimal', m, n, digits) < _predicted_cost('phase_type', m, n, digits):
+        return 'decimal'
+    return 'phase_type'
+
+
+def _start_digits(rel_err):
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        digits = 17 + np.log10(rel_err / _EPS)
+    digits = np.where(np.isfinite(digits), digits, 60)
+    return np.clip(np.ceil(digits), 28, 400)
+
+
+def _slow(x, scales, kind, method, start_digits):
+    """Run one of the exact fallbacks ('decimal' or 'phase_type') on all points of x."""
+    if method == 'decimal':
+        value, converged = _decimal_method(x, scales, kind, start_digits)
+        if not np.all(converged):
+            value[~converged] = _phase_type_method(x[~converged], scales, kind)
+        return value
+    return _phase_type_method(x, scales, kind)
+
+
 def _pointwise(x, scales, kind, tolerance, method):
-    """Cascade for arbitrary points x >= 0 (finite):
-    closed form (float) -> Decimal closed form for points failing the error bound -> phase-type
-    for repeated scales or points where Decimal did not converge."""
+    """Cascade for arbitrary points x > 0 (finite): float closed form, then for the points that
+    fail its error bound either the Decimal closed form or the phase-type method, chosen by the
+    cost model. Repeated scales go straight to the phase-type method."""
     distinct = np.unique(scales).size == scales.size
     if method in ('closed_form', 'decimal') and not distinct:
         raise ValueError(f"method={method!r} requires distinct scale parameters.")
+    n = scales.size
 
     if method == 'phase_type' or not distinct:
         return _phase_type_method(x, scales, kind)
 
-    res = np.empty(x.size)
     value, rel_err = _closed_form_method(x, scales, kind)
     if method == 'closed_form':
         return value
+    if method == 'decimal':
+        return _slow(x, scales, kind, 'decimal', _start_digits(rel_err))
 
     good = np.isfinite(value) & (value > 0) & (rel_err <= tolerance)
-    if method == 'decimal':
-        good[:] = False
-    res[good] = value[good]
-
+    res = np.where(good, value, 0.0)
     todo = np.flatnonzero(~good)
     if todo.size:
-        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-            digits = 17 + np.log10(rel_err[todo] / _EPS)
-        digits = np.where(np.isfinite(digits), digits, 60)
-        start_digits = np.clip(np.ceil(digits), 28, 400)
-        dec_value, converged = _decimal_method(x[todo], scales, kind, start_digits)
-        res[todo[converged]] = dec_value[converged]
-        left = todo[~converged]
-        if left.size:
-            if method == 'decimal':
-                warnings.warn(f"Decimal evaluation did not converge for {left.size} point(s); using the phase-type method for them.")
-            res[left] = _phase_type_method(x[left], scales, kind)
+        digits = _start_digits(rel_err[todo])
+        slow_method = _choose_slow_method(todo.size, n, float(np.median(digits)), tolerance)
+        res[todo] = _slow(x[todo], scales, kind, slow_method, digits)
     return res
+
+
+def _sanity_failures(x, values, kind, scales, tolerance):
+    """Cheap common-sense checks on a finished result (x: finite, > 0, 1-D; values aligned).
+    Returns the list of failed checks (empty if everything looks right)."""
+    failures = []
+    if not np.all(np.isfinite(values)):
+        failures.append('non-finite values')
+    if np.any(values < 0):
+        failures.append('negative values')
+    if kind == 'cdf' and np.any(values > 1 + 1e-12):
+        failures.append('cdf above 1')
+    if kind == 'pdf' and scales.size > 1 and np.any(values > 1.0 / scales.min()):
+        failures.append('pdf above the bound 1/min(scales)')
+
+    if x.size >= 3:
+        order = np.argsort(x, kind='stable')
+        xs, vs = x[order], values[order]
+        significant = np.abs(np.diff(vs)) > 1e-12 * np.max(np.abs(vs))
+        signs = np.sign(np.diff(vs))[significant]
+        if kind == 'cdf':
+            if np.any(signs < 0):
+                failures.append('cdf not monotone')
+        else:
+            # The hypoexponential pdf is log-concave, hence unimodal: at most one rise->fall switch.
+            switches = np.count_nonzero(np.diff(signs) != 0)
+            if switches > 1:
+                failures.append('pdf not unimodal')
+
+        # If the grid is fine and covers the distribution, the pdf must integrate to 1.
+        if kind == 'pdf' and x.size >= 1000:
+            mean, std = scales.sum(), np.sqrt(np.sum(scales ** 2))
+            steps = np.diff(xs)
+            covers = xs[0] <= 1e-3 * mean and xs[-1] >= mean + 8 * std
+            fine = steps.max() <= 0.05 * std
+            if covers and fine:
+                mass = sp.integrate.simpson(vs, x=xs)
+                if abs(mass - 1) > max(1e-3, tolerance):
+                    failures.append(f'pdf integrates to {mass:.6f} instead of 1')
+    return failures
 
 
 def _evaluate(x, scales, kind, tolerance, method):
@@ -288,7 +365,10 @@ def _evaluate(x, scales, kind, tolerance, method):
     out[xf == np.inf] = 0.0 if kind == 'pdf' else 1.0
     out[xf == 0] = (1.0 / scales[0] if n == 1 else 0.0) if kind == 'pdf' else 0.0
     valid = np.isfinite(xf) & (xf > 0)
+    xv = xf[valid]
 
+    used = method
+    computed = None
     use_convolution = kind == 'pdf' and n > 1 and (
         method == 'convolution'
         or (method == 'auto' and x_arr.size >= _CONVOLUTION_MIN_POINTS and _is_uniform_grid_from_zero(x_arr)))
@@ -297,18 +377,41 @@ def _evaluate(x, scales, kind, tolerance, method):
             raise ValueError("method='convolution' requires a 1-D uniformly spaced grid starting at 0.")
         conv = _convolution_method(x_arr, scales)
         if method == 'convolution':
-            return conv
-        # Validate the discretization against exact values at a few points (grid independent,
-        # unlike checking that the pdf integrates to 1) and fall back to the pointwise methods
-        # if the convolution is not accurate enough.
-        check = np.unique(np.concatenate([[np.argmax(conv)], np.linspace(1, x_arr.size - 1, 15).astype(int)]))
-        exact = _pointwise(x_arr[check], scales, 'pdf', tolerance, 'auto')
-        if np.all(np.abs(conv[check] - exact) <= tolerance * conv.max()):
-            return conv
-        warnings.warn("Convolution on this grid was not accurate enough (grid too coarse); falling back to pointwise methods.")
+            computed = conv[valid]
+        else:
+            # Validate the discretization against exact values at a few points (grid independent,
+            # unlike checking that the pdf integrates to 1) and fall back to the pointwise methods
+            # if the convolution is not accurate enough.
+            check = np.unique(np.concatenate([[np.argmax(conv)], np.linspace(1, x_arr.size - 1, 15).astype(int)]))
+            exact = _pointwise(x_arr[check], scales, 'pdf', tolerance, 'auto')
+            if np.all(np.abs(conv[check] - exact) <= tolerance * conv.max()):
+                computed, used = conv[valid], 'convolution'
+            else:
+                warnings.warn("Convolution on this grid was not accurate enough (grid too coarse); falling back to pointwise methods.")
 
-    if valid.any():
-        out[valid] = _pointwise(xf[valid], scales, kind, tolerance, method)
+    if computed is None and xv.size:
+        computed = _pointwise(xv, scales, kind, tolerance, method)
+
+    if xv.size:
+        # Final common-sense checks. With method='auto' a failure triggers a recomputation of all
+        # points with an exact method (phase-type first, then Decimal if scales are distinct);
+        # with a forced method we only warn, since the caller asked for that method's raw output.
+        failures = _sanity_failures(xv, computed, kind, scales, tolerance)
+        if failures and method == 'auto':
+            distinct = np.unique(scales).size == scales.size
+            retries = ['phase_type'] + (['decimal'] if distinct else [])
+            if used == 'phase_type':
+                retries.remove('phase_type')
+            for retry in retries:
+                computed = _slow(xv, scales, kind, retry, np.full(xv.size, 60.0))
+                used = retry
+                failures = _sanity_failures(xv, computed, kind, scales, tolerance)
+                if not failures:
+                    break
+        if failures:
+            warnings.warn(f"hypoexp_{kind} sanity checks failed ({'; '.join(failures)}); returning the best available result.")
+        out[valid] = computed
+
     return float(out[0]) if x_arr.ndim == 0 else out.reshape(x_arr.shape)
 
 

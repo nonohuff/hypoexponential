@@ -49,7 +49,8 @@ def test_auto_matches_high_precision_reference(scales, kind, func):
             assert gi < 1e-280
         else:
             assert gi == pytest.approx(ref, rel=1e-9), (xi, scales)
-        assert func(xi, scales) == gi  # scalar call gives the same value as the array call
+        # scalar call agrees with the array call (the fallback chosen may differ, so allow rounding-level differences)
+        assert func(xi, scales) == pytest.approx(gi, rel=1e-13, abs=1e-300)
 
 
 @pytest.mark.parametrize("method", ['decimal', 'phase_type'])
@@ -109,8 +110,9 @@ def test_narrow_grid_returns_quickly_and_correctly():
 
 def test_result_does_not_depend_on_grid():
     expected = hypoexp_pdf(2.0, [1.0, 1.00000001, 1.00000002])
-    for grid in (np.array([2.0]), np.linspace(0, 2, 3), np.linspace(1.5, 2, 100000)[::-1], np.array([[2.0, 7.0]])):
-        assert hypoexp_pdf(grid, [1.0, 1.00000001, 1.00000002]).flat[0] == pytest.approx(expected, rel=1e-12)
+    for grid in (np.array([2.0]), np.linspace(0, 2, 3), np.linspace(1.5, 2, 100000)[::-1], np.array([[7.0, 2.0]])):
+        at_two = list(grid.flat).index(2.0)
+        assert hypoexp_pdf(grid, [1.0, 1.00000001, 1.00000002]).flat[at_two] == pytest.approx(expected, rel=1e-12)
 
 
 def test_pdf_integrates_to_cdf():
@@ -156,3 +158,41 @@ def test_weights_and_rvs():
     assert samples.mean() == pytest.approx(6.0, rel=0.02)
     assert hypoexp_rvs([1.0, 2.0], size=(3, 4)).shape == (3, 4)
     assert dist.sample(10).shape == (10,)
+
+
+def test_slow_method_selection_heuristic():
+    from hypoexp import _choose_slow_method, _predicted_cost
+    assert _choose_slow_method(1, 2, 28, 1e-6) == 'decimal'        # one point, two scales: Decimal is cheaper
+    assert _choose_slow_method(100, 2, 28, 1e-6) == 'phase_type'   # many points: vectorized phase-type wins
+    assert _choose_slow_method(1, 20, 240, 1e-6) == 'phase_type'   # many scales / high precision: Decimal too slow
+    assert _choose_slow_method(10000, 5, 28, 1e-14) == 'decimal'   # more accuracy than doubles allow -> Decimal
+    assert _predicted_cost('decimal', 1000, 5, 28) > _predicted_cost('phase_type', 1000, 5, 28)
+
+
+def test_sanity_checks_catch_garbage_and_fall_back(monkeypatch):
+    import hypoexp
+
+    def broken_closed_form(x, scales, kind):
+        garbage = np.where(np.arange(x.size) % 2 == 0, -1.0, 2.0) * np.exp(-x)  # negative & oscillating
+        return garbage, np.zeros(x.size)  # ...while claiming zero rounding error
+
+    monkeypatch.setattr(hypoexp, '_closed_form_method', broken_closed_form)
+    x = np.linspace(0.01, 10, 200)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        pdf = hypoexp.hypoexp_pdf(x, [1, 2])          # auto: silently recomputed with an exact method
+        cdf = hypoexp.hypoexp_cdf(x, [1, 2])
+    np.testing.assert_allclose(pdf, np.exp(-x / 2) - np.exp(-x), rtol=1e-12)
+    np.testing.assert_allclose(cdf, 1 - 2 * np.exp(-x / 2) + np.exp(-x), rtol=1e-9)  # float reference cancels at small x
+    with pytest.warns(UserWarning, match="negative values"):   # forced method: raw output plus a warning
+        hypoexp.hypoexp_pdf(x, [1, 2], method='closed_form')
+
+
+def test_sanity_checks_pass_on_correct_results():
+    from hypoexp import _sanity_failures
+    x = np.linspace(1e-3, 60, 5000)
+    for scales in ([1.0, 2.0], [1.0, 1.0, 3.0], [0.1, 0.1000001]):
+        sc = np.array(scales)
+        assert _sanity_failures(x, hypoexp_pdf(x, sc), 'pdf', sc, 1e-6) == []
+        assert _sanity_failures(x, hypoexp_cdf(x, sc), 'cdf', sc, 1e-6) == []
+    assert 'pdf integrates' in _sanity_failures(x, 2 * hypoexp_pdf(x, [1.0, 2.0]), 'pdf', np.array([1.0, 2.0]), 1e-6)[-1]
