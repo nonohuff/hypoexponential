@@ -393,3 +393,59 @@ def test_convolution_auto_path_matches_exact_and_falls_back_on_coarse_grid():
     with pytest.warns(UserWarning, match='Convolution'):
         p = hypoexp_pdf(np.linspace(0, 1e4, 100_001), [1.0, 2.0])
     assert p[2] == pytest.approx(_reference(0.2, [1.0, 2.0], 'pdf'), rel=1e-6)
+
+
+# ---- Random variates and the class interface ---------------------------------------------------
+
+@pytest.mark.parametrize("scales", [[2.0], [1.0, 2.0], [1.0, 1.0], [0.1, 0.1, 0.1, 5.0], [1e-3, 1e3]])
+def test_rvs_follow_the_cdf(scales):
+    import scipy.stats as st
+    np.random.seed(123)
+    scales = np.asarray(scales)
+    samples = hypoexp_rvs(scales, size=100_000)
+    assert samples.shape == (100_000,) and np.all(samples > 0)
+    assert samples.mean() == pytest.approx(scales.sum(), rel=0.02)
+    assert samples.var() == pytest.approx(np.sum(scales ** 2), rel=0.05)
+    assert st.kstest(samples, lambda t: hypoexp_cdf(t, scales)).pvalue > 1e-3
+
+
+def test_rvs_size_handling():
+    for scales in [2.0, [2.0], [1.0, 2.0], [1.0, 1.0]]:
+        assert hypoexp_rvs(scales).shape == (1000,)
+        assert hypoexp_rvs(scales, size=5).shape == (5,)
+        assert hypoexp_rvs(scales, size=np.int64(4)).shape == (4,)
+        assert hypoexp_rvs(scales, size=1).shape == (1,)
+        assert hypoexp_rvs(scales, size=0).shape == (0,)
+        assert hypoexp_rvs(scales, size=(2, 3)).shape == (2, 3)
+        assert hypoexp_rvs(scales, size=[2, 2]).shape == (2, 2)
+    with pytest.raises(ValueError):
+        hypoexp_rvs([1.0, 2.0], size=-1)
+    with pytest.raises(ValueError):
+        hypoexp_rvs([0.0, 2.0], size=3)
+
+
+def test_class_interface_consistency():
+    import scipy.stats as st
+    dist = Hypoexponential([1.0, 2.0, 4.0])
+    assert dist.params == {'rates': [1.0, 2.0, 4.0]}
+    assert Hypoexponential(2).params == {'rates': [2.0]}
+    assert Hypoexponential(np.array([[1.0, 2.0]])).params == {'rates': [1.0, 2.0]}
+    # closed-form mixture weights reproduce the pdf: sum_i w_i eta_i e^{-eta_i x}
+    eta = np.array(dist.params['rates'])
+    assert np.sum(np.array(dist.weights) * eta * np.exp(-eta * 0.7)) == pytest.approx(dist.pdf(0.7), rel=1e-12)
+    assert sum(dist.weights) == pytest.approx(1.0)
+    # scalar in -> float out, arrays keep their shape
+    assert isinstance(dist.pdf(0.5), float) and isinstance(dist.cdf(0.5), float)
+    assert dist.pdf([0.5, 1.0]).shape == (2,) and dist.cdf(np.array([[0.5], [1.0]])).shape == (2, 1)
+    assert list(dist.cdf([-1.0, 0.0, np.inf])) == [0.0, 0.0, 1.0]
+    assert list(dist.pdf([-1.0, 0.0, np.inf])) == [0.0, 0.0, 0.0]
+    # cdf is the integral of the pdf: numerical derivative of the cdf matches the pdf
+    xs = np.array([0.1, 0.5, 2.0, 6.0]); h = 1e-5
+    assert np.allclose((dist.cdf(xs + h) - dist.cdf(xs - h)) / (2 * h), dist.pdf(xs), rtol=1e-7)
+    # repeated rates: Erlang(3, 1) against scipy's gamma
+    erlang = Hypoexponential([1, 1, 1])
+    assert erlang.cdf(3.0) == pytest.approx(st.gamma.cdf(3, 3), rel=1e-13)
+    assert erlang.pdf(3.0) == pytest.approx(st.gamma.pdf(3, 3), rel=1e-13)
+    assert erlang.sample(7).shape == (7,) and Hypoexponential([2.0]).sample(4).shape == (4,)
+    np.random.seed(5)
+    assert Hypoexponential([1.0, 2.0]).sample(100_000).mean() == pytest.approx(1.5, rel=0.02)
